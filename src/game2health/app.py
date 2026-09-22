@@ -15,8 +15,8 @@ import sys
 import threading
 import time
 
-from PySide6.QtCore import QPointF, QRectF, QSettings, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
+from PySide6.QtCore import QPointF, QRectF, QSettings, QTimer, QUrl, Qt, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QImage, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from .bridge import GAME_URL, GameBridge
 
 from .input import (
     BackendUnavailable,
@@ -63,6 +64,9 @@ KEY_NAMES = {
     "esc": "Esc", "space": "Space", "w": "W", "a": "A", "s": "S", "d": "D",
     "p": "P",
 }
+
+OUTPUT_KEYBOARD = "keyboard"
+OUTPUT_WEBSOCKET = "websocket"
 
 # Horizontal center-crop choices; 1.0 = full frame. Labels shown in the UI.
 CROP_CHOICES: tuple[tuple[str, float], ...] = (
@@ -292,6 +296,13 @@ class Game2HealthWindow(QMainWindow):
         self.resize(1020, 720)
 
         self.settings_store = QSettings("Game2Health", "Game2Health")
+        saved_output = str(
+            self.settings_store.value("control/output", OUTPUT_KEYBOARD)
+        )
+        self._output_mode = (
+            saved_output if saved_output in {OUTPUT_KEYBOARD, OUTPUT_WEBSOCKET}
+            else OUTPUT_KEYBOARD
+        )
         self._lock = threading.RLock()
         self._mailbox = VisionMailbox(self._lock)
         self._model_bytes = load_model_bytes()
@@ -305,11 +316,12 @@ class Game2HealthWindow(QMainWindow):
         self._worker = None
         self._backend = None
         self._emitter = None
+        self._bridge: GameBridge | None = None
         self._current_camera = None
         self._last_dims = None
         self._dims_changed = False
         self._countdown_value = 0
-        self._resume_esc_armed = False  # send one Esc on first ACTIVE entry
+        self._game_start_armed = False
         self._pending_cal_start = False
         self._tick_counter = 0
         self._mapping = default_mapping()
@@ -323,6 +335,7 @@ class Game2HealthWindow(QMainWindow):
         self._ui.addWidget(self._control_page)
 
         self._load_mapping()
+        self._configure_output_mode(self._output_mode)
         self.backend_ready.connect(self._backend_probe_done)
         self.cameras_ready.connect(self._populate_camera_combo)
         self._probe_backend()
@@ -403,6 +416,22 @@ class Game2HealthWindow(QMainWindow):
         body.addWidget(self._preview, 3)
 
         side = QVBoxLayout()
+        side.addWidget(self._section("Control output"))
+        self.output_combo = QComboBox()
+        self.output_combo.addItem("Keyboard keys (Esc pause)", OUTPUT_KEYBOARD)
+        self.output_combo.addItem(
+            "Game userscript (WebSocket)", OUTPUT_WEBSOCKET
+        )
+        self.output_combo.setCurrentIndex(
+            self.output_combo.findData(self._output_mode)
+        )
+        self.output_combo.currentIndexChanged.connect(
+            self._on_output_mode_changed
+        )
+        side.addWidget(self.output_combo)
+        self.bridge_label = QLabel("")
+        self.bridge_label.setWordWrap(True)
+        side.addWidget(self.bridge_label)
         side.addWidget(self._section("Key mapping"))
         self._key_rows = QVBoxLayout()
         side.addLayout(self._key_rows)
@@ -557,6 +586,62 @@ class Game2HealthWindow(QMainWindow):
         store.remove("video/crop")  # migrated
         if self._worker is not None:
             self._worker.set_crop(width, height)
+
+    # ------------------------------------------------------------------
+    # control output
+    # ------------------------------------------------------------------
+
+    def _on_output_mode_changed(self, _index: int) -> None:
+        mode = str(self.output_combo.currentData())
+        if mode == self._output_mode:
+            return
+        self._output_mode = mode
+        self.settings_store.setValue("control/output", mode)
+        self._configure_output_mode(mode)
+        self._update_settings_ui()
+
+    def _configure_output_mode(self, mode: str) -> None:
+        if mode == OUTPUT_WEBSOCKET:
+            if self._bridge is None:
+                bridge = GameBridge(parent=self)
+                bridge.status_changed.connect(self._on_bridge_status)
+                bridge.client_changed.connect(
+                    lambda _connected: self._update_settings_ui()
+                )
+                self._bridge = bridge
+            self.bridge_label.setText(
+                self._bridge.status + self._userscript_help()
+            )
+        else:
+            if self._bridge is not None:
+                self._bridge.close()
+                self._bridge = None
+            self.bridge_label.setText(
+                "WebSocket integration disabled; ordinary keyboard keys "
+                "and Esc are used."
+            )
+
+    def _on_bridge_status(self, status: str) -> None:
+        self.bridge_label.setText(status + self._userscript_help())
+
+    @staticmethod
+    def _userscript_help() -> str:
+        return (
+            "\nInstall userscripts/game2health-subway.user.js in Tampermonkey "
+            "once. Chrome 147+ asks for Local Network Access on first use; "
+            "choose Allow."
+        )
+
+    def _output_ready(self) -> bool:
+        if self._output_mode == OUTPUT_WEBSOCKET:
+            return self._bridge is not None and self._bridge.listening
+        return self._backend is not None and self._emitter is not None
+
+    def _open_game(self) -> None:
+        if not QDesktopServices.openUrl(QUrl(GAME_URL)):
+            self._on_bridge_status(
+                "Could not open the default browser; open the game URL manually"
+            )
 
     def _apply_mapping(self) -> None:
         mapping = {}
@@ -734,15 +819,26 @@ class Game2HealthWindow(QMainWindow):
         if not actions:
             return
         mode = sm.mode
+        use_bridge = self._output_mode == OUTPUT_WEBSOCKET
         now_ms = time.monotonic() * 1000.0
         for action in actions:
             if action is Action.PAUSE_TOGGLE:
-                text = "⏸ ESC" if mode is ControllerMode.AUTO_PAUSED \
-                    else "▶ ESC"
+                target = "GAME" if use_bridge else "ESC"
+                text = (f"⏸ {target}"
+                        if mode is ControllerMode.AUTO_PAUSED
+                        else f"▶ {target}")
             else:
                 text = BADGE_TEXT[action]
             self._feedback.append(Badge(text, now_ms))
-        if self._emitter is not None:
+        if use_bridge:
+            if self._bridge is not None:
+                if Action.PAUSE_TOGGLE in actions:
+                    command = ("pause"
+                               if mode is ControllerMode.AUTO_PAUSED
+                               else "resume")
+                    self._bridge.command(command)
+                self._bridge.emit(actions)
+        elif self._emitter is not None:
             self._emitter.emit(actions)
 
     # ------------------------------------------------------------------
@@ -830,17 +926,22 @@ class Game2HealthWindow(QMainWindow):
 
     def _refresh_control_status(self, mode, stable, landmarks,
                                 steps=0) -> None:
-        if self._resume_esc_armed and landmarks is not None and mode is not (
+        if self._game_start_armed and landmarks is not None and mode is not (
                 ControllerMode.CALIBRATING):
             status = self._last_cal_status
             if status is None or not status.missing_indices:
-                # All key landmarks detected: start/resume the game with a
-                # single Esc (the user left it paused or at a start screen).
-                self._resume_esc_armed = False
-                self._feedback.append(
-                    Badge("▶ ESC", time.monotonic() * 1000.0))
-                if self._emitter is not None:
-                    self._emitter.emit((Action.PAUSE_TOGGLE,))
+                # All key landmarks detected: start once, after calibration.
+                self._game_start_armed = False
+                if self._output_mode == OUTPUT_WEBSOCKET:
+                    self._feedback.append(
+                        Badge("▶ GAME", time.monotonic() * 1000.0))
+                    if self._bridge is not None:
+                        self._bridge.command("start")
+                else:
+                    self._feedback.append(
+                        Badge("▶ ESC", time.monotonic() * 1000.0))
+                    if self._emitter is not None:
+                        self._emitter.emit((Action.PAUSE_TOGGLE,))
         pose_live = landmarks is not None and (
             time.monotonic() * 1000.0 - self._mailbox.landmark_ts_ms < 1_000
         )
@@ -864,10 +965,13 @@ class Game2HealthWindow(QMainWindow):
                 "Controlling — keep jogging; shift lanes left/right, jump or "
                 "crouch in place to trigger keys.")
         elif mode is ControllerMode.CALIBRATING:
+            if self._output_mode == OUTPUT_WEBSOCKET:
+                suffix = "the userscript starts the game after calibration."
+            else:
+                suffix = "Esc to start the game is sent after calibration."
             self.hint_label.setText(
                 "Step back until the whole skeleton is visible — calibration "
-                "runs automatically; Esc to start the game is sent after "
-                "calibration completes.")
+                f"runs automatically; {suffix}")
 
     def _refresh_settings_status(self, status) -> None:
         calibrated = self._pipeline[1].calibrated
@@ -886,8 +990,7 @@ class Game2HealthWindow(QMainWindow):
         elif calibrated:
             self.cal_label.setText("✓ Existing calibration — ready to start control.")
         self.start_button.setEnabled(
-            self._backend is not None and self._emitter is not None
-            and self._worker is not None)
+            self._output_ready() and self._worker is not None)
 
     @staticmethod
     def _cal_phase_text(status) -> str:
@@ -900,10 +1003,16 @@ class Game2HealthWindow(QMainWindow):
         return "Waiting for picture…"
 
     def _update_settings_ui(self) -> None:
-        backend_ok = self._backend is not None and self._emitter is not None
+        output_ready = self._output_ready()
+        keyboard = self._output_mode == OUTPUT_KEYBOARD
         self.start_button.setEnabled(
-            backend_ok and self._worker is not None)
-        self.test_button.setEnabled(backend_ok)
+            output_ready and self._worker is not None)
+        self.test_button.setEnabled(
+            keyboard and self._backend is not None and self._emitter is not None
+        )
+        self.test_combo.setEnabled(keyboard)
+        for combo in self._key_action_rows.values():
+            combo.setEnabled(keyboard)
         self.retry_button.setEnabled(self._current_camera is not None)
 
     # ------------------------------------------------------------------
@@ -913,12 +1022,16 @@ class Game2HealthWindow(QMainWindow):
     def _begin_control(self) -> None:
         with self._lock:
             _, detector, _sm = self._pipeline
-            if self._emitter is None:
+            if not self._output_ready():
                 return
             detector.clear_transients()
-        self._resume_esc_armed = True
+        self._game_start_armed = True
         self._ui.setCurrentWidget(self._control_page)
         self._apply_on_top(True)
+        if self._output_mode == OUTPUT_WEBSOCKET:
+            # LaunchServices activates the default browser after this window
+            # has applied its always-on-top flags, so focus remains in-game.
+            self._open_game()
         if self._pipeline[1].calibrated:
             self._start_countdown()
         else:
@@ -961,6 +1074,8 @@ class Game2HealthWindow(QMainWindow):
             self._feedback.clear()
         if self._emitter is not None:
             self._emitter.release_all()
+        if self._output_mode == OUTPUT_WEBSOCKET and self._bridge is not None:
+            self._bridge.command("pause")
         self._stop_on_top()
         self._ui.setCurrentWidget(self._settings_page)
         self._update_settings_ui()
@@ -1001,7 +1116,11 @@ class Game2HealthWindow(QMainWindow):
         self._reset_pipeline()
         if self._emitter is not None:
             self._emitter.release_all()
-            if was_running:
+        if was_running:
+            if self._output_mode == OUTPUT_WEBSOCKET:
+                if self._bridge is not None:
+                    self._bridge.command("pause")
+            elif self._emitter is not None:
                 self._emitter.emergency_pause()
         self._stop_on_top()
         self._ui.setCurrentWidget(self._settings_page)
@@ -1022,6 +1141,10 @@ class Game2HealthWindow(QMainWindow):
         if self._emitter is not None:
             self._emitter.shutdown()
             self._emitter = None
+        if self._bridge is not None:
+            self._bridge.command("pause")
+            self._bridge.close()
+            self._bridge = None
         super().closeEvent(event)
 
 

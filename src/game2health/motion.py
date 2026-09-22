@@ -753,12 +753,11 @@ def _scaled_pt(xy: tuple[float, float], aspect: float) -> tuple[float, float]:
 
 
 class ControllerStateMachine:
-    """Tracks the mode the UI/keyboard are in.
+    """Tracks controller mode and the target character's game lane.
 
-    Maintains ``game_lane`` — the lane the target game character occupies —
-    from direction events forwarded while ACTIVE.  Separately remembers the
-    user's physical lane when auto-pause begins; resume must happen in that
-    physical lane because it can legitimately differ from ``game_lane``.
+    ``game_lane`` advances only for direction events forwarded while ACTIVE.
+    Starting and resuming require running activity but never a particular
+    physical camera lane.
     """
 
     def __init__(self) -> None:
